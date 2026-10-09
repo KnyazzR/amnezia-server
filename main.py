@@ -87,7 +87,7 @@ def generate_config():
             
             # Шаг 2: Скачиваем сам .conf файл
             # Если ссылка относительная, делаем её абсолютной
-            if not conf_url.startswith("http"):
+            if not conf_url.startswith("https"):
                 conf_url = f"{AMNEZIA_API_URL}{conf_url}"
                 
             conf_response = client.get(conf_url, headers=headers)
