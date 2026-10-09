@@ -5,8 +5,15 @@ services:
     build: .
     container_name: amnezia_config_server
     ports:
-      - "8080:80" # Доступ к серверу будет по адресу http://localhost:8080
+      - "8080:80"
+    environment:
+      - AMNEZIA_HOST=192.168.1.100      # IP сервера с Amnezia
+      - AMNEZIA_PORT=22
+      - AMNEZIA_USER=root
+      - AMNEZIA_KEY_PATH=/app/ssh_key
+      - AMNEZIA_CONTAINER=amnezia-awg   # имя контейнера (уточните через docker ps)
+      - WG_CONFIG_PATH=/etc/wireguard/wg0.conf
     volumes:
-      # Сохраняем сгенерированные конфиги на хост, чтобы они не пропали при перезапуске
-      - ./configs_data:/app/configs 
+      - ./configs_data:/app/configs
+      - ./ssh_key:/app/ssh_key:ro       # приватный SSH-ключ без пароля
     restart: unless-stopped
