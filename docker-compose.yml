@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  amnezia-server:
+    build: .
+    container_name: amnezia_config_server
+    ports:
+      - "8080:80" # Доступ к серверу будет по адресу http://localhost:8080
+    volumes:
+      # Сохраняем сгенерированные конфиги на хост, чтобы они не пропали при перезапуске
+      - ./configs_data:/app/configs 
+    restart: unless-stopped
