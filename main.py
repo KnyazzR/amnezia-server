@@ -1,175 +1,118 @@
 import os
-import json
 import uuid
-import paramiko
-from fastapi import FastAPI, HTTPException
+import httpx
+from datetime import datetime, timedelta
+from fastapi import FastAPI, HTTPException, Header, status, Depends
 from fastapi.responses import PlainTextResponse, JSONResponse
 
-app = FastAPI(title="Amnezia Config Server")
+app = FastAPI(title="Amnezia Config Proxy Server")
 
-# Настройки подключения к серверу с Amnezia
-AMNEZIA_HOST = os.getenv("AMNEZIA_HOST", "192.168.1.100")  # IP сервера с Amnezia
-AMNEZIA_PORT = int(os.getenv("AMNEZIA_PORT", "22"))
-AMNEZIA_USER = os.getenv("AMNEZIA_USER", "root")
-AMNEZIA_KEY_PATH = os.getenv("AMNEZIA_KEY_PATH", "/app/ssh_key")  # приватный SSH-ключ
+# 1. НАШ ключ безопасности
+OUR_API_KEY = os.getenv("OUR_API_KEY")
+if not OUR_API_KEY:
+    raise RuntimeError("Переменная окружения OUR_API_KEY не задана!")
 
-# Имя контейнера с AmneziaWG (уточните через `docker ps`)
-AMNEZIA_CONTAINER = os.getenv("AMNEZIA_CONTAINER", "amnezia-awg")
+# 2. Настройки подключения к amneziawg-api (проект taphix)
+AMNEZIA_API_URL = os.getenv("AMNEZIA_API_URL", "http://localhost:8000").rstrip("/")
+AMNEZIA_API_TOKEN = os.getenv("AMNEZIA_API_TOKEN")
+AMNEZIA_SERVER_ID = int(os.getenv("AMNEZIA_SERVER_ID", "1"))
 
-# Путь к конфигу внутри контейнера
-WG_CONFIG_PATH = os.getenv("WG_CONFIG_PATH", "/etc/wireguard/wg0.conf")
+if not AMNEZIA_API_TOKEN:
+    raise RuntimeError("Переменная окружения AMNEZIA_API_TOKEN не задана!")
 
 CONFIG_DIR = "configs"
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
 
-def get_ssh_client():
-    """SSH-подключение к серверу с Amnezia."""
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(
-            hostname=AMNEZIA_HOST,
-            port=AMNEZIA_PORT,
-            username=AMNEZIA_USER,
-            key_filename=AMNEZIA_KEY_PATH,
-            timeout=10,
+async def verify_our_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
+    """Проверяет наш внутренний API-ключ (защита от спама)."""
+    import hmac
+    if not hmac.compare_digest(x_api_key, OUR_API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key",
         )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"SSH connection failed: {e}")
-    return client
 
 
-def run_remote(client, command: str) -> str:
-    """Выполняет команду на удалённом сервере."""
-    stdin, stdout, stderr = client.exec_command(command, timeout=30)
-    exit_code = stdout.channel.recv_exit_status()
-    err = stderr.read().decode()
-    if exit_code != 0:
-        raise HTTPException(status_code=500, detail=f"Remote command failed: {err}")
-    return stdout.read().decode()
+@app.get("/")
+def root():
+    return {"status": "running", "docs": "/docs"}
 
 
 @app.get("/script", response_class=PlainTextResponse)
 def get_script():
-    """Отдаёт bash-скрипт для клиента."""
+    """Отдаёт bash-скрипт для клиента (публично)."""
     return """#!/bin/bash
-set -e
 echo "=== Amnezia client setup ==="
-# Здесь ваша логика применения конфига
+# Здесь ваша логика применения скачанного конфига
 echo "Done."
 """
 
 
-@app.get("/generate")
+@app.get("/generate", dependencies=[Depends(verify_our_api_key)])
 def generate_config():
-    """Реально создаёт нового клиента AmneziaWG на сервере."""
+    """
+    1. Делает запрос к amneziawg-api для создания клиента.
+    2. Забирает готовый .conf файл.
+    3. Сохраняет его у нас и отдаёт ссылку.
+    """
     config_id = str(uuid.uuid4())[:8]
     client_name = f"client_{config_id}"
+    
+    # Дата истечения: +1 год от сегодня (формат DD.MM.YYYY, как требует amneziawg-api)
+    expires_until = (datetime.now() + timedelta(days=365)).strftime("%d.%m.%Y")
 
-    ssh = get_ssh_client()
+    headers = {
+        "Authorization": f"Bearer {AMNEZIA_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "server_id": AMNEZIA_SERVER_ID,
+        "client_name": client_name,
+        "expires_until": expires_until
+    }
+
     try:
-        # ШАГ 1. Генерируем ключи для нового клиента
-        gen_private_cmd = f"docker exec {AMNEZIA_CONTAINER} wg genkey"
-        client_private_key = run_remote(ssh, gen_private_cmd).strip()
+        with httpx.Client(timeout=30.0) as client:
+            # Шаг 1: Просим amneziawg-api создать клиента
+            response = client.post(f"{AMNEZIA_API_URL}/api/clients", json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            # В документации taphix поле намеренно называется "succsess" (с опечаткой), проверяем оба варианта
+            if not data.get("succsess") and not data.get("success"):
+                raise HTTPException(status_code=500, detail=f"Amnezia API failed: {data}")
+            
+            conf_url = data["files"]["conf_url"]
+            
+            # Шаг 2: Скачиваем сам .conf файл
+            # Если ссылка относительная, делаем её абсолютной
+            if not conf_url.startswith("http"):
+                conf_url = f"{AMNEZIA_API_URL}{conf_url}"
+                
+            conf_response = client.get(conf_url, headers=headers)
+            conf_response.raise_for_status()
+            conf_content = conf_response.text
 
-        gen_public_cmd = f"docker exec {AMNEZIA_CONTAINER} sh -c 'echo {client_private_key} | wg pubkey'"
-        client_public_key = run_remote(ssh, gen_public_cmd).strip()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Ошибка связи с Amnezia API: {str(e)}")
 
-        # ШАГ 2. Получаем текущий конфиг сервера
-        get_server_conf_cmd = f"docker exec {AMNEZIA_CONTAINER} cat {WG_CONFIG_PATH}"
-        server_conf = run_remote(ssh, get_server_conf_cmd)
-
-        # Парсим параметры сервера
-        server_public_key = ""
-        server_port = "51820"
-        allowed_ips = "0.0.0.0/0, ::/0"
-        dns = "1.1.1.1"
-        
-        for line in server_conf.split("\n"):
-            if line.startswith("PublicKey"):
-                server_public_key = line.split("=")[1].strip()
-            elif line.startswith("ListenPort"):
-                server_port = line.split("=")[1].strip()
-            elif line.startswith("DNS"):
-                dns = line.split("=")[1].strip()
-
-        # ШАГ 3. Добавляем нового peer в конфиг сервера
-        # Находим следующий свободный IP (упрощённо - можно улучшить)
-        peer_ip = f"10.8.1.{100 + hash(config_id) % 100}"
-        
-        add_peer_cmd = f"""docker exec {AMNEZIA_CONTAINER} sh -c 'cat >> {WG_CONFIG_PATH} << EOF
-
-[Peer]
-# {client_name}
-PublicKey = {client_public_key}
-AllowedIPs = {peer_ip}/32
-EOF'"""
-        run_remote(ssh, add_peer_cmd)
-
-        # ШАГ 4. Перезагружаем WireGuard для применения изменений
-        reload_cmd = f"docker exec {AMNEZIA_CONTAINER} wg syncconf {WG_CONFIG_PATH} <(wg-quick strip {WG_CONFIG_PATH})"
-        try:
-            run_remote(ssh, reload_cmd)
-        except:
-            # Если wg syncconf не работает, просто перезапускаем контейнер
-            restart_cmd = f"docker restart {AMNEZIA_CONTAINER}"
-            run_remote(ssh, restart_cmd)
-
-        # ШАГ 5. Получаем Amnezia-специфичные параметры (Jc, Jmin, Jmax и т.д.)
-        # Эти параметры обычно в переменных окружения контейнера или в конфиге
-        get_amnezia_params_cmd = f"docker exec {AMNEZIA_CONTAINER} cat /etc/wireguard/wg0.conf | grep -E '^(Jc|Jmin|Jmax|S1|S2|H1|H2|H3|H4)'"
-        amnezia_params_raw = run_remote(ssh, get_amnezia_params_cmd)
-        
-        # Парсим Amnezia-параметры
-        amnezia_params = {}
-        for line in amnezia_params_raw.split("\n"):
-            if "=" in line:
-                key, value = line.split("=", 1)
-                amnezia_params[key.strip()] = value.strip()
-
-        # ШАГ 6. Формируем клиентский конфиг
-        client_config = f"""[Interface]
-PrivateKey = {client_private_key}
-Address = {peer_ip}/24
-DNS = {dns}
-Jc = {amnezia_params.get('Jc', '4')}
-Jmin = {amnezia_params.get('Jmin', '40')}
-Jmax = {amnezia_params.get('Jmax', '70')}
-S1 = {amnezia_params.get('S1', '78')}
-S2 = {amnezia_params.get('S2', '24')}
-H1 = {amnezia_params.get('H1', '123456789')}
-H2 = {amnezia_params.get('H2', '987654321')}
-H3 = {amnezia_params.get('H3', '112233445')}
-H4 = {amnezia_params.get('H4', '556677889')}
-
-[Peer]
-PublicKey = {server_public_key}
-Endpoint = {AMNEZIA_HOST}:{server_port}
-AllowedIPs = {allowed_ips}
-PersistentKeepalive = 25
-"""
-
-        # Сохраняем конфиг локально
-        local_path = os.path.join(CONFIG_DIR, f"{config_id}.conf")
-        with open(local_path, "w", encoding="utf-8") as f:
-            f.write(client_config)
-
-    finally:
-        ssh.close()
+    # Шаг 3: Сохраняем конфиг локально у нас в Docker
+    local_path = os.path.join(CONFIG_DIR, f"{config_id}.conf")
+    with open(local_path, "w", encoding="utf-8") as f:
+        f.write(conf_content)
 
     return JSONResponse({
         "status": "success",
         "config_id": config_id,
         "client_name": client_name,
-        "client_ip": peer_ip,
         "download_url": f"/configs/{config_id}",
     })
 
 
-@app.get("/configs/{config_id}")
+@app.get("/configs/{config_id}", dependencies=[Depends(verify_our_api_key)])
 def get_config(config_id: str):
-    """Отдаёт готовый конфиг."""
+    """Отдаёт сохраненный конфиг по ID."""
     path = os.path.join(CONFIG_DIR, f"{config_id}.conf")
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Config not found")

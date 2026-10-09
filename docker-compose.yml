@@ -1,19 +1,13 @@
 version: '3.8'
 
 services:
-  amnezia-server:
+  amnezia-proxy:
     build: .
-    container_name: amnezia_config_server
+    container_name: amnezia_proxy_server
     ports:
       - "8080:80"
-    environment:
-      - AMNEZIA_HOST=192.168.1.100      # IP сервера с Amnezia
-      - AMNEZIA_PORT=22
-      - AMNEZIA_USER=root
-      - AMNEZIA_KEY_PATH=/app/ssh_key
-      - AMNEZIA_CONTAINER=amnezia-awg   # имя контейнера (уточните через docker ps)
-      - WG_CONFIG_PATH=/etc/wireguard/wg0.conf
+    env_file:
+      - .env
     volumes:
       - ./configs_data:/app/configs
-      - ./ssh_key:/app/ssh_key:ro       # приватный SSH-ключ без пароля
     restart: unless-stopped
